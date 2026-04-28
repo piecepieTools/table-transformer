@@ -483,10 +483,31 @@ def step_configure():
             key=f"op_{col}",
             horizontal=False,
         )
-        default_lbl1 = f"{OSYM.get(op,'?')} {thresh_val}"
-        default_lbl2 = f"{CSYM.get(op,'?')} {thresh_val}"
-        lbl1 = st.text_input("Group 1 label:", value=default_lbl1, key=f"l1_{col}")
-        lbl2 = st.text_input("Group 2 label:", value=default_lbl2, key=f"l2_{col}")
+        auto1 = f"{OSYM.get(op,'?')} {thresh_val:g}"
+        auto2 = f"{CSYM.get(op,'?')} {thresh_val:g}"
+
+        # Streamlit ignores value= if the widget key already exists in session
+        # state. The only reliable way to update it is to write directly into
+        # st.session_state[key] BEFORE the widget renders.
+        # We track (op, threshold) in a snapshot; when either changes AND the
+        # user hasn't customised the label (it still equals the previous auto
+        # value), we overwrite it.
+        snap = st.session_state.get(f"_snap_{col}")   # (op, thresh, auto1, auto2)
+        if snap is None:
+            # First render — seed both labels
+            st.session_state[f"l1_{col}"] = auto1
+            st.session_state[f"l2_{col}"] = auto2
+            st.session_state[f"_snap_{col}"] = (op, thresh_val, auto1, auto2)
+        elif op != snap[0] or thresh_val != snap[1]:
+            # op or threshold changed — update labels that haven't been customised
+            if st.session_state.get(f"l1_{col}", snap[2]) == snap[2]:
+                st.session_state[f"l1_{col}"] = auto1
+            if st.session_state.get(f"l2_{col}", snap[3]) == snap[3]:
+                st.session_state[f"l2_{col}"] = auto2
+            st.session_state[f"_snap_{col}"] = (op, thresh_val, auto1, auto2)
+
+        lbl1 = st.text_input("Group 1 label:", key=f"l1_{col}")
+        lbl2 = st.text_input("Group 2 label:", key=f"l2_{col}")
 
     st.markdown("---")
     col_l, col_r = st.columns([1,5])
@@ -567,6 +588,7 @@ def step_verify():
                 cfg["order"] = order
 
             elif dtype == "multi_value":
+                # ── Column-level label ──────────────────────────────
                 new_label = st.text_input("Section heading:", value=cfg["label"],
                                           key=f"v_lbl_{col}")
                 cfg["label"] = new_label
@@ -580,23 +602,6 @@ def step_verify():
                     "**Terms** — edit display labels and use ▲ ▼ to reorder. "
                     "Percentages are per patient (can sum >100%)."
                 )
-
-                def _swap_mv(order, label_map, col, i, j):
-                    # Read current widget values into label_map BEFORE swapping,
-                    # so edited-but-unsaved labels are captured.
-                    for k in range(len(order)):
-                        wk = f"mv_lbl_{col}_{k}"
-                        if wk in st.session_state:
-                            label_map[order[k]] = st.session_state[wk]
-                    # Swap the order list
-                    order[i], order[j] = order[j], order[i]
-                    # Force-write the swapped labels into widget keys by position
-                    # so the text_input widgets show the correct labels after rerun.
-                    for k, term in enumerate(order):
-                        st.session_state[f"mv_lbl_{col}_{k}"] = label_map[term]
-                    S.cat_order[col] = order
-                    cfg["order"]     = order
-                    cfg["label_map"] = label_map
 
                 for idx, term in enumerate(order):
                     cnt = counts.get(term, 0)
@@ -613,9 +618,13 @@ def step_verify():
                     label_map[term] = new_lbl
 
                     if r[2].button("▲", key=f"mv_up_{col}_{idx}", disabled=(idx==0)):
-                        _swap_mv(order, label_map, col, idx, idx-1); st.rerun()
+                        order[idx], order[idx-1] = order[idx-1], order[idx]
+                        S.cat_order[col] = order; cfg["order"] = order
+                        cfg["label_map"] = label_map; st.rerun()
                     if r[3].button("▼", key=f"mv_dn_{col}_{idx}", disabled=(idx==len(order)-1)):
-                        _swap_mv(order, label_map, col, idx, idx+1); st.rerun()
+                        order[idx], order[idx+1] = order[idx+1], order[idx]
+                        S.cat_order[col] = order; cfg["order"] = order
+                        cfg["label_map"] = label_map; st.rerun()
 
                 S.cat_order[col] = order
                 cfg["order"]     = order
@@ -638,9 +647,13 @@ def step_verify():
     st.markdown("---")
     col_l, col_r = st.columns([1,5])
     with col_l:
-        back = 3 if any(S.col_types[c]=="numeric" for c in S.selected) else 2
         if st.button("← Back"):
-            go(back)
+            if any(S.col_types[c] == "numeric" for c in S.selected):
+                S.num_queue = [c for c in S.selected if S.col_types[c] == "numeric"]
+                S.cur_num = None
+                go(3)
+            else:
+                go(2)
     with col_r:
         if st.button("Build Word table →", type="primary"):
             S.word_bytes = build_word_bytes(S.selected, S.configs, df)
