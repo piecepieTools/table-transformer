@@ -1,12 +1,12 @@
 """
 Table Transformer — Streamlit version
-Identical logic to the desktop app, rewritten for the web.
 Steps: Upload → Select → Configure numeric → Verify → Download
 """
 
 import streamlit as st
 import pandas as pd
 import io, os
+from collections import Counter
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -23,36 +23,33 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────────────────────
-#  Custom CSS  (black / white / gray)
+#  Custom CSS
 # ──────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* Global font */
   html, body, [class*="css"] { font-family: 'Segoe UI', sans-serif; }
-
-  /* Hide Streamlit chrome when embedded */
   #MainMenu, footer, header { visibility: hidden; }
 
-  /* Step pill bar */
+  /* Constrain width for iframe / Lovable embed */
+  .block-container {
+    max-width: 780px !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+
   .step-bar { display:flex; gap:0; margin-bottom:1.5rem; }
   .step-pill {
     flex:1; text-align:center; padding:7px 4px; font-size:12px;
     background:#F2F2F2; color:#AAAAAA; border:1px solid #E0E0E0;
   }
-  .step-pill.active  { background:#222; color:#FFF; font-weight:600; }
-  .step-pill.done    { background:#555; color:#FFF; }
+  .step-pill.active { background:#222; color:#FFF; font-weight:600; }
+  .step-pill.done   { background:#555; color:#FFF; }
 
-  /* Section headings */
   .section-title { font-size:22px; font-weight:700; color:#111; margin-bottom:4px; }
   .section-sub   { font-size:14px; color:#777; margin-bottom:1.5rem; }
 
-  /* Card-style containers */
-  .card {
-    background:#FFF; border:1px solid #E0E0E0;
-    border-radius:6px; padding:20px 24px; margin-bottom:12px;
-  }
-
-  /* Stats strip */
   .stats-strip {
     display:flex; background:#EFEFEF; border-radius:4px;
     padding:12px 0; margin:12px 0 20px; text-align:center;
@@ -61,7 +58,6 @@ st.markdown("""
   .stat-val  { font-size:18px; font-weight:700; color:#111; }
   .stat-lbl  { font-size:11px; color:#888; margin-top:2px; }
 
-  /* Success box */
   .success-box {
     background:#FFF; border:2px solid #222; border-radius:8px;
     padding:48px; text-align:center; margin-top:2rem;
@@ -70,7 +66,6 @@ st.markdown("""
   .success-title { font-size:24px; font-weight:700; color:#111; margin:12px 0 4px; }
   .success-sub   { font-size:14px; color:#888; }
 
-  /* Streamlit button overrides */
   div.stButton > button {
     background:#222 !important; color:#FFF !important;
     border:none !important; border-radius:4px !important;
@@ -91,28 +86,41 @@ st.markdown("""
 #  Constants
 # ──────────────────────────────────────────────────────────────
 CAT_THRESHOLD = 10
-ARIAL         = "Arial"
-OSYM = {"<":"<", "<=":"≤", ">":">", ">=":"≥"}
-CSYM = {"<":"≥", "<=":" >", ">":"≤", ">=":"<"}
-COMP = {"<":">=", "<=":">", ">":"<=", ">=":"<"}
+ARIAL = "Arial"
+OSYM = {"<": "<",  "<=": "≤", ">": ">",  ">=": "≥"}
+CSYM = {"<": "≥",  "<=": ">", ">": "≤",  ">=": "<"}
 
 STEPS = ["Upload", "Select", "Configure", "Verify", "Download"]
 
+# Ordinal suffixes helper
+def ordinal(n):
+    """Return e.g. 1 → '1st', 2 → '2nd', 3 → '3rd', 4 → '4th' …"""
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{['th','st','nd','rd','th','th','th','th','th','th'][n % 10]}"
+
 # ──────────────────────────────────────────────────────────────
-#  Session state init
+#  Session state
 # ──────────────────────────────────────────────────────────────
 def _init():
     defaults = {
-        "step":            1,
-        "df":              None,
-        "col_types":       {},
-        "selected":        [],
-        "configs":         {},
-        "cat_order":       {},
-        "num_queue":       [],
-        "cur_num":         None,
-        "num_total":       0,
-        "word_bytes":      None,
+        "step":       1,
+        "df":         None,
+        "col_types":  {},
+        "selected":   [],
+        # configs[col]: type/label for cat; type/label/modes for numeric
+        "configs":    {},
+        # entries[col] = [ {"key": raw_val, "label": display_str}, ... ]
+        # Used for categorical, multi_value, AND ordered_categorical.
+        "entries":    {},
+        # For ordered_categorical: queue of cols needing configuration
+        "ord_queue":  [],
+        "cur_ord":    None,
+        "ord_total":  0,
+        "num_queue":  [],
+        "cur_num":    None,
+        "num_total":  0,
+        "word_bytes": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -122,24 +130,44 @@ _init()
 S = st.session_state
 
 # ──────────────────────────────────────────────────────────────
-#  Helpers
+#  Type detection
 # ──────────────────────────────────────────────────────────────
 def _is_multi_value(series):
-    """Return True if the column looks like comma-separated multi-value strings."""
     non_null = series.dropna().astype(str)
     if non_null.empty:
         return False
-    return non_null.str.contains(",").mean() >= 0.1   # ≥10 % of rows have a comma
+    return non_null.str.contains(",").mean() >= 0.1
+
+def _is_ordered_categorical(series):
+    """
+    Heuristic: integer-typed column with ≤ CAT_THRESHOLD unique values,
+    OR a string column whose values are all purely numeric (e.g. '1','2','3').
+    The idea is columns like treatment line stored as 1,2,3,4,5.
+    """
+    if pd.api.types.is_integer_dtype(series):
+        return 2 <= series.nunique(dropna=True) <= CAT_THRESHOLD
+    # String column where every non-null value looks like an integer
+    non_null = series.dropna().astype(str).str.strip()
+    if non_null.empty:
+        return False
+    return (non_null.str.fullmatch(r'\d+').all() and
+            2 <= non_null.nunique() <= CAT_THRESHOLD)
 
 def detect_type(series):
     if not pd.api.types.is_numeric_dtype(series):
         if _is_multi_value(series):
             return "multi_value"
         return "categorical"
-    return "categorical" if series.nunique(dropna=True) <= CAT_THRESHOLD else "numeric"
+    if series.nunique(dropna=True) <= CAT_THRESHOLD:
+        if _is_ordered_categorical(series):
+            return "ordered_categorical"
+        return "categorical"
+    return "numeric"
 
+# ──────────────────────────────────────────────────────────────
+#  Multi-value helpers
+# ──────────────────────────────────────────────────────────────
 def split_multi(series):
-    """Return a flat list of all individual terms (lowercased + stripped)."""
     terms = []
     for val in series.dropna().astype(str):
         for t in val.split(","):
@@ -149,18 +177,38 @@ def split_multi(series):
     return terms
 
 def multi_value_counts(series):
-    """
-    Returns an ordered dict  {term: count}  sorted by frequency desc.
-    Percentages should be computed against len(series.dropna()) — i.e.
-    the number of patients who have *any* value in this column, so that
-    each term's % can exceed 100% in aggregate (expected for multi-select).
-    """
-    terms = split_multi(series)
-    from collections import Counter
-    return Counter(terms)
+    return Counter(split_multi(series))
 
+# ──────────────────────────────────────────────────────────────
+#  Build initial entries list for a column
+#  entries = [ {"key": raw_key, "label": display_label}, ... ]
+# ──────────────────────────────────────────────────────────────
+def build_entries(col, df, dtype):
+    if dtype == "categorical":
+        vals = list(df[col].value_counts(dropna=True).index)
+        return [{"key": str(v), "label": str(v)} for v in vals]
+    elif dtype == "ordered_categorical":
+        # Sort numerically so 1 < 2 < ... < N
+        vals = sorted(df[col].dropna().unique(), key=lambda x: float(x))
+        entries = []
+        for v in vals:
+            n = int(float(v))
+            entries.append({"key": str(v), "label": f"{ordinal(n)} line"})
+        return entries
+    else:  # multi_value
+        counts = multi_value_counts(df[col])
+        vals = sorted(counts.keys(), key=lambda k: -counts[k])
+        return [{"key": v, "label": v.title()} for v in vals]
+
+# ──────────────────────────────────────────────────────────────
+#  Formatting
+# ──────────────────────────────────────────────────────────────
 def fmt_pct(pct):
     return f"{int(pct)}%" if pct == int(pct) else f"{pct:.1f}%"
+
+def fmt_thresh(v):
+    """Drop .0 for round numbers, keep decimals otherwise."""
+    return f"{v:g}"
 
 def go(step):
     S.step = step
@@ -172,10 +220,9 @@ def go(step):
 def render_steps():
     pills = ""
     for i, name in enumerate(STEPS, 1):
-        cls = "done" if i < S.step else ("active" if i == S.step else "step-pill")
-        if i < S.step: cls = "step-pill done"
+        if i < S.step:    cls = "step-pill done"
         elif i == S.step: cls = "step-pill active"
-        else: cls = "step-pill"
+        else:             cls = "step-pill"
         pills += f'<div class="{cls}">{i}. {name}</div>'
     st.markdown(f'<div class="step-bar">{pills}</div>', unsafe_allow_html=True)
 
@@ -184,8 +231,9 @@ def render_steps():
 # ──────────────────────────────────────────────────────────────
 def _set_arial(run):
     rPr = run._r.get_or_add_rPr()
-    rf  = OxmlElement("w:rFonts")
-    for k in ("w:ascii","w:hAnsi","w:cs"): rf.set(qn(k), ARIAL)
+    rf = OxmlElement("w:rFonts")
+    for k in ("w:ascii", "w:hAnsi", "w:cs"):
+        rf.set(qn(k), ARIAL)
     rPr.insert(0, rf)
 
 def _wcell(cell, text, bold=False, indent=False, center=False):
@@ -200,7 +248,7 @@ def _clr(cell):
     tcPr = cell._tc.get_or_add_tcPr()
     for s in tcPr.findall(qn("w:shd")): tcPr.remove(s)
     shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"),"clear"); shd.set(qn("w:color"),"auto"); shd.set(qn("w:fill"),"auto")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto"); shd.set(qn("w:fill"), "auto")
     tcPr.append(shd)
 
 def _rh(row, t=400):
@@ -210,11 +258,11 @@ def _rh(row, t=400):
 def _hborder(row):
     for cell in row.cells:
         tcPr = cell._tc.get_or_add_tcPr()
-        tcB  = tcPr.find(qn("w:tcBorders"))
+        tcB = tcPr.find(qn("w:tcBorders"))
         if tcB is None: tcB = OxmlElement("w:tcBorders"); tcPr.append(tcB)
         b = OxmlElement("w:bottom")
-        b.set(qn("w:val"),"single"); b.set(qn("w:sz"),"4")
-        b.set(qn("w:space"),"0"); b.set(qn("w:color"),"666666")
+        b.set(qn("w:val"), "single"); b.set(qn("w:sz"), "4")
+        b.set(qn("w:space"), "0"); b.set(qn("w:color"), "666666")
         tcB.append(b)
 
 def _drow(tbl, c1, c2="", c3="", bold1=False, ind1=False):
@@ -224,7 +272,7 @@ def _drow(tbl, c1, c2="", c3="", bold1=False, ind1=False):
     _wcell(row.cells[1], c2, center=True)
     _wcell(row.cells[2], c3, center=True)
 
-def build_word_bytes(col_order, configs, df):
+def build_word_bytes(col_order, configs, entries, df):
     tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.docx")
     if os.path.exists(tpl):
         doc = Document(tpl)
@@ -245,7 +293,7 @@ def build_word_bytes(col_order, configs, df):
     for row in tbl.rows:
         for i, cell in enumerate(row.cells):
             tcPr = cell._tc.get_or_add_tcPr()
-            tcW  = tcPr.find(qn("w:tcW"))
+            tcW = tcPr.find(qn("w:tcW"))
             if tcW is None: tcW = OxmlElement("w:tcW"); tcPr.insert(0, tcW)
             tcW.set(qn("w:w"), str(ws[i])); tcW.set(qn("w:type"), "dxa")
 
@@ -256,38 +304,39 @@ def build_word_bytes(col_order, configs, df):
     _wcell(hdr.cells[2], "%",        bold=True, center=True)
     _hborder(hdr)
 
-    OPS_fn = {"<": lambda s,v: s<v, "<=": lambda s,v: s<=v,
-              ">": lambda s,v: s>v, ">=": lambda s,v: s>=v}
+    OPS_fn = {
+        "<":  lambda s, v: s < v,
+        "<=": lambda s, v: s <= v,
+        ">":  lambda s, v: s > v,
+        ">=": lambda s, v: s >= v,
+    }
 
     for col in col_order:
         cfg    = configs[col]
         series = df[col]
         total  = len(series.dropna())
+        dtype  = cfg["type"]
 
-        if cfg["type"] == "categorical":
+        if dtype in ("categorical", "ordered_categorical"):
             _drow(tbl, cfg["label"], "", "", bold1=True)
-            for val in cfg.get("order", list(series.value_counts(dropna=True).index)):
-                cnt = (series == val).sum()
+            for entry in entries.get(col, []):
+                cnt = (series.astype(str) == str(entry["key"])).sum()
                 pct = cnt / total * 100 if total else 0
-                _drow(tbl, str(val), str(cnt), fmt_pct(pct), ind1=True)
+                _drow(tbl, entry["label"], str(cnt), fmt_pct(pct), ind1=True)
             n_miss = series.isna().sum()
             if n_miss:
-                _drow(tbl, "Missing", str(n_miss), fmt_pct(n_miss/len(series)*100), ind1=True)
+                _drow(tbl, "Missing", str(n_miss), fmt_pct(n_miss / len(series) * 100), ind1=True)
 
-        elif cfg["type"] == "multi_value":
-            # Section header — N column shows total respondents
+        elif dtype == "multi_value":
             _drow(tbl, cfg["label"], str(total), "", bold1=True)
             counts = multi_value_counts(series)
-            term_order = cfg.get("order", sorted(counts.keys(), key=lambda k: -counts[k]))
-            label_map  = cfg.get("label_map", {})
-            for term in term_order:
-                cnt  = counts.get(term, 0)
-                pct  = cnt / total * 100 if total else 0
-                display = label_map.get(term, term.title())
-                _drow(tbl, display, str(cnt), fmt_pct(pct), ind1=True)
+            for entry in entries.get(col, []):
+                cnt = counts.get(entry["key"], 0)
+                pct = cnt / total * 100 if total else 0
+                _drow(tbl, entry["label"], str(cnt), fmt_pct(pct), ind1=True)
             n_miss = series.isna().sum()
             if n_miss:
-                _drow(tbl, "Missing", str(n_miss), fmt_pct(n_miss/len(series)*100), ind1=True)
+                _drow(tbl, "Missing", str(n_miss), fmt_pct(n_miss / len(series) * 100), ind1=True)
 
         else:  # numeric
             for mc in cfg["modes"]:
@@ -303,15 +352,15 @@ def build_word_bytes(col_order, configs, df):
                     op = mc["op"]; v = mc["threshold"]
                     _drow(tbl, label, "", "", bold1=True)
                     mask1 = OPS_fn[op](series, v)
-                    cnt1  = mask1.sum(); pct1 = cnt1/total*100 if total else 0
+                    cnt1  = mask1.sum(); pct1 = cnt1 / total * 100 if total else 0
                     mask2 = ~mask1 & series.notna()
-                    cnt2  = mask2.sum(); pct2 = cnt2/total*100 if total else 0
+                    cnt2  = mask2.sum(); pct2 = cnt2 / total * 100 if total else 0
                     _drow(tbl, mc["label_true"],  str(cnt1), fmt_pct(pct1), ind1=True)
                     _drow(tbl, mc["label_false"], str(cnt2), fmt_pct(pct2), ind1=True)
                     n_miss = series.isna().sum()
                     if n_miss:
                         _drow(tbl, "Missing", str(n_miss),
-                              fmt_pct(n_miss/len(series)*100), ind1=True)
+                              fmt_pct(n_miss / len(series) * 100), ind1=True)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -327,7 +376,7 @@ def step_upload():
 
     uploaded = st.file_uploader(
         "Upload your Excel file",
-        type=["xlsx","xls","xlsm"],
+        type=["xlsx", "xls", "xlsm"],
         help="Supports .xlsx, .xls, .xlsm",
         label_visibility="collapsed",
     )
@@ -358,32 +407,28 @@ def step_select():
     all_cols = list(df.columns)
 
     for row_start in range(0, len(all_cols), cols_per_row):
-        row_cols = all_cols[row_start:row_start+cols_per_row]
+        row_cols = all_cols[row_start:row_start + cols_per_row]
         ui_cols  = st.columns(cols_per_row)
         for ui_col, col in zip(ui_cols, row_cols):
             with ui_col:
                 dtype  = S.col_types[col]
                 unique = df[col].nunique(dropna=True)
-                badge  = dtype  # "categorical", "numeric", or "multi_value"
+                badge_label = {"multi_value": "multi-value", "ordered_categorical": "ordered"}.get(dtype, dtype)
                 checked = st.checkbox(
-                    f"**{col}**",
-                    value=True,
-                    key=f"sel_{col}",
-                    help=f"{badge} · {unique} unique values"
+                    f"**{col}**", value=True, key=f"sel_{col}",
+                    help=f"{badge_label} · {unique} unique values"
                 )
-                badge_label = "multi-value" if dtype == "multi_value" else badge
                 st.caption(f"`{badge_label}` · {unique} unique values")
                 if checked:
                     selected.append(col)
 
-    # Excel preview
     st.markdown("---")
     st.markdown("**Data preview** — first 8 rows")
     st.dataframe(df.head(8), use_container_width=True, height=220)
-    st.caption(f"Showing first {min(8,len(df))} of {len(df)} rows · {len(df.columns)} columns")
+    st.caption(f"Showing first {min(8, len(df))} of {len(df)} rows · {len(df.columns)} columns")
 
     st.markdown("---")
-    col_l, col_r = st.columns([1,5])
+    col_l, col_r = st.columns([1, 5])
     with col_l:
         if st.button("← Back"):
             go(1)
@@ -392,29 +437,27 @@ def step_select():
             if not selected:
                 st.error("Please select at least one column."); return
             S.selected = selected
-            # Init categorical configs
+
+            # Init entries + configs for cat/multi_value/ordered_categorical.
+            # Only build if not already present so Back → re-Continue keeps edits.
             for col in selected:
                 dtype = S.col_types[col]
-                if dtype == "categorical":
-                    order = list(df[col].value_counts(dropna=True).index)
-                    S.configs[col]   = {"type":"categorical","label":col,"order":order}
-                    S.cat_order[col] = list(order)
-                elif dtype == "multi_value":
-                    counts = multi_value_counts(df[col])
-                    order  = sorted(counts.keys(), key=lambda k: -counts[k])
-                    # label_map: term → display label (editable in verify step)
-                    label_map = {t: t.title() for t in order}
-                    S.configs[col]   = {
-                        "type":      "multi_value",
-                        "label":     col,
-                        "order":     order,
-                        "label_map": label_map,
-                    }
-                    S.cat_order[col] = list(order)
-            # Queue numeric
-            S.num_queue = [c for c in selected if S.col_types[c]=="numeric"]
+                if dtype in ("categorical", "multi_value", "ordered_categorical"):
+                    if col not in S.entries:
+                        S.entries[col] = build_entries(col, df, dtype)
+                    if col not in S.configs:
+                        S.configs[col] = {"type": dtype, "label": col}
+
+            # Queue ordered_categorical columns (need label configuration)
+            S.ord_queue = [c for c in selected if S.col_types[c] == "ordered_categorical"]
+            S.ord_total = len(S.ord_queue)
+
+            S.num_queue = [c for c in selected if S.col_types[c] == "numeric"]
             S.num_total = len(S.num_queue)
-            if S.num_queue:
+            if S.ord_queue:
+                S.cur_ord = None
+                go(3)
+            elif S.num_queue:
                 S.cur_num = None
                 go(3)
             else:
@@ -422,17 +465,128 @@ def step_select():
 
 # ──────────────────────────────────────────────────────────────
 #  STEP 3 — Configure numeric columns
+#
+#  FIX: Threshold group labels auto-track op + value.
+#  Mechanism: store (op, thresh_val) snapshot in session state.
+#  When it changes, delete the label widget keys so Streamlit
+#  resets them to the new auto-computed `value=` default.
+#  The user can still type a custom label — it only resets on
+#  the NEXT op/value change.
+#
+#  FIX: Back button puts current column back into the queue
+#  so navigating back to step 2 and forward again doesn't skip it.
 # ──────────────────────────────────────────────────────────────
 def step_configure():
+    # ── Route: ordered_categorical first, then numeric ─────────
+    # If there are still ordered cols to configure, handle those first.
+    if S.ord_queue:
+        _configure_ordered()
+    elif S.num_queue:
+        _configure_numeric()
+    else:
+        go(4)
+
+# ──────────────────────────────────────────────────────────────
+#  Step 3a — Configure ordered_categorical columns
+#  User sees the auto-detected entries (e.g. "1st line", "2nd line")
+#  and can rename the last one (e.g. "≥5th line") and reorder.
+# ──────────────────────────────────────────────────────────────
+def _configure_ordered():
+    if S.cur_ord is None or S.cur_ord not in S.ord_queue:
+        S.cur_ord = S.ord_queue[0]
+
+    col  = S.cur_ord
+    df   = S.df
+    done = S.ord_total - len(S.ord_queue) + 1
+
+    st.markdown(
+        f'<p class="section-title">Configure: {col}</p>'
+        f'<p class="section-sub">Ordered column {done} of {S.ord_total} — '
+        f'set a label for each value</p>',
+        unsafe_allow_html=True)
+
+    cfg     = S.configs.get(col, {"type": "ordered_categorical", "label": col})
+    entries = S.entries.get(col, build_entries(col, df, "ordered_categorical"))
+    total   = len(df[col].dropna())
+
+    # Section heading
+    new_heading = st.text_input("Section heading in table:", value=cfg["label"],
+                                key=f"ord_heading_{col}")
+    cfg["label"] = new_heading
+
+    st.markdown("---")
+    st.markdown(
+        "**Set a display label for each value.**  "
+        "Reorder with ▲ ▼ — drag the last category up if needed.  \n"
+        "_Tip: rename the last row to_ `≥5th line` _if it's a collapsed group._")
+
+    for idx, entry in enumerate(entries):
+        # Count per value
+        cnt = (df[col].astype(str) == str(entry["key"])).sum()
+        pct = cnt / total * 100 if total else 0
+
+        r = st.columns([0.5, 1.2, 2.8, 0.45, 0.45])
+
+        r[0].markdown(
+            f"<div style='padding-top:8px;color:#aaa;font-size:12px'>{idx+1}.</div>",
+            unsafe_allow_html=True)
+        r[1].markdown(
+            f"<div style='padding-top:8px;font-size:13px;color:#555'>"
+            f"<b>{entry['key']}</b>"
+            f"<span style='color:#aaa;font-size:11px;margin-left:4px'>"
+            f"n={cnt}</span></div>",
+            unsafe_allow_html=True)
+
+        new_lbl = r[2].text_input(
+            "Label", value=entry["label"],
+            key=f"ord_lbl_{col}_{idx}",
+            label_visibility="collapsed")
+        entries[idx]["label"] = new_lbl
+
+        if r[3].button("▲", key=f"ord_up_{col}_{idx}", disabled=(idx == 0)):
+            entries[idx], entries[idx-1] = entries[idx-1], entries[idx]
+            S.entries[col] = entries; st.rerun()
+        if r[4].button("▼", key=f"ord_dn_{col}_{idx}",
+                       disabled=(idx == len(entries)-1)):
+            entries[idx], entries[idx+1] = entries[idx+1], entries[idx]
+            S.entries[col] = entries; st.rerun()
+
+    S.entries[col] = entries
+    S.configs[col] = cfg
+
+    st.markdown("---")
+    col_l, col_r = st.columns([1, 5])
+    with col_l:
+        if st.button("← Back", key=f"ord_back_{col}"):
+            if col not in S.ord_queue:
+                S.ord_queue.insert(0, col)
+            S.cur_ord = None
+            go(2)
+    with col_r:
+        if st.button("Next →", type="primary", key=f"ord_next_{col}"):
+            S.ord_queue.pop(0)
+            S.cur_ord = S.ord_queue[0] if S.ord_queue else None
+            if S.ord_queue:
+                st.rerun()
+            elif S.num_queue:
+                S.cur_num = None
+                go(3)   # stay on step 3 for numeric
+            else:
+                go(4)
+
+# ──────────────────────────────────────────────────────────────
+#  Step 3b — Configure numeric columns (unchanged logic)
+# ──────────────────────────────────────────────────────────────
+def _configure_numeric():
+    if not S.num_queue:
+        go(4); return
     if S.cur_num is None or S.cur_num not in S.num_queue:
-        if not S.num_queue:
-            go(4); return
         S.cur_num = S.num_queue[0]
 
-    col   = S.cur_num
-    df    = S.df
-    s     = df[col].dropna()
-    done  = S.num_total - len(S.num_queue) + 1
+    col  = S.cur_num
+    df   = S.df
+    s    = df[col].dropna()
+    done = S.num_total - len(S.num_queue) + 1
 
     st.markdown(
         f'<p class="section-title">Configure: {col}</p>'
@@ -449,59 +603,93 @@ def step_configure():
 
     st.markdown("**Select one or more presentation modes:**")
 
-    use_mean   = st.checkbox("Mean ± SD",            key=f"m_mean_{col}")
-    use_median = st.checkbox("Median [IQR]",          key=f"m_med_{col}")
-    use_thresh = st.checkbox("Groups by threshold",   key=f"m_thr_{col}")
+    use_mean   = st.checkbox("Mean ± SD",          key=f"m_mean_{col}")
+    use_median = st.checkbox("Median [IQR]",        key=f"m_med_{col}")
+    use_thresh = st.checkbox("Groups by threshold", key=f"m_thr_{col}")
 
-    lbl_mean   = st.text_input("Label for Mean ± SD row:",
-                               value=f"{col} (Mean ± SD)",
-                               key=f"lbl_mean_{col}",
-                               disabled=not use_mean)
+    lbl_mean = st.text_input("Label for Mean ± SD row:",
+                             value=f"{col} (Mean ± SD)",
+                             key=f"lbl_mean_{col}",
+                             disabled=not use_mean)
     lbl_median = st.text_input("Label for Median row:",
                                value=f"{col} (Median)",
                                key=f"lbl_med_{col}",
                                disabled=not use_median)
 
-    lbl_thresh = f"{col}"; thresh_val = None; op = "<"; lbl1 = ""; lbl2 = ""
+    lbl_thresh = col
+    thresh_val = None
+    op = "<"
+    auto1 = auto2 = ""
+    lbl1 = lbl2 = ""
+
     if use_thresh:
         st.markdown("---")
         st.markdown("**Threshold settings:**")
+
         lbl_thresh = st.text_input("Label for threshold row:",
                                    value=col, key=f"lbl_thr_{col}")
+
         thresh_val = st.number_input("Threshold value:",
                                      value=float(s.median()),
                                      key=f"thresh_{col}")
+
         op = st.radio(
             "First group condition:",
-            options=["<","<=",">",">="],
+            options=["<", "<=", ">", ">="],
             format_func=lambda x: {
-                "<":  f"Smaller than  ( < )",
-                "<=": f"Smaller than or equal to  ( ≤ )",
-                ">":  f"Greater than  ( > )",
-                ">=": f"Greater than or equal to  ( ≥ )",
+                "<":  "Smaller than  ( < )",
+                "<=": "Smaller than or equal to  ( ≤ )",
+                ">":  "Greater than  ( > )",
+                ">=": "Greater than or equal to  ( ≥ )",
             }[x],
             key=f"op_{col}",
             horizontal=False,
         )
-        default_lbl1 = f"{OSYM.get(op,'?')} {thresh_val}"
-        default_lbl2 = f"{CSYM.get(op,'?')} {thresh_val}"
-        lbl1 = st.text_input("Group 1 label:", value=default_lbl1, key=f"l1_{col}")
-        lbl2 = st.text_input("Group 2 label:", value=default_lbl2, key=f"l2_{col}")
+
+        # Auto-labels that reflect current op + threshold value
+        auto1 = f"{OSYM.get(op, '?')} {fmt_thresh(thresh_val)}"
+        auto2 = f"{CSYM.get(op, '?')} {fmt_thresh(thresh_val)}"
+
+        # Detect if op or threshold changed — if so, reset label widgets
+        snap_key = f"_tsnap_{col}"
+        prev_snap = S.get(snap_key)
+        cur_snap  = (op, thresh_val)
+        if prev_snap != cur_snap:
+            # Delete widget state so `value=auto` kicks in on next render
+            for wk in (f"l1_{col}", f"l2_{col}"):
+                if wk in st.session_state:
+                    del st.session_state[wk]
+            st.session_state[snap_key] = cur_snap
+
+        lbl1 = st.text_input("Group 1 label:", value=auto1, key=f"l1_{col}")
+        lbl2 = st.text_input("Group 2 label:", value=auto2, key=f"l2_{col}")
 
     st.markdown("---")
-    col_l, col_r = st.columns([1,5])
+    col_l, col_r = st.columns([1, 5])
     with col_l:
         if st.button("← Back"):
-            go(2)
+            # Ensure current col stays at front of queue
+            if col not in S.num_queue:
+                S.num_queue.insert(0, col)
+            S.cur_num = None
+            # If there were ordered cols, go back to configure those; else step 2
+            if S.ord_total > 0:
+                S.ord_queue = [c for c in S.selected if S.col_types[c] == "ordered_categorical"]
+                S.cur_ord = None
+                go(3)
+            else:
+                go(2)
     with col_r:
         if st.button("Next →", type="primary", key=f"next_{col}"):
             if not (use_mean or use_median or use_thresh):
                 st.error("Please select at least one presentation mode."); return
             modes = []
             if use_mean:
-                modes.append({"mode":"mean_sd",   "label": lbl_mean.strip() or f"{col} (Mean ± SD)"})
+                modes.append({"mode": "mean_sd",
+                              "label": lbl_mean.strip() or f"{col} (Mean ± SD)"})
             if use_median:
-                modes.append({"mode":"median",    "label": lbl_median.strip() or f"{col} (Median)"})
+                modes.append({"mode": "median",
+                              "label": lbl_median.strip() or f"{col} (Median)"})
             if use_thresh:
                 if thresh_val is None:
                     st.error("Enter a threshold value."); return
@@ -510,10 +698,10 @@ def step_configure():
                     "label":       lbl_thresh.strip() or col,
                     "op":          op,
                     "threshold":   float(thresh_val),
-                    "label_true":  lbl1.strip() or f"{OSYM.get(op,'')} {thresh_val}",
-                    "label_false": lbl2.strip() or f"{CSYM.get(op,'')} {thresh_val}",
+                    "label_true":  lbl1.strip() or auto1,
+                    "label_false": lbl2.strip() or auto2,
                 })
-            S.configs[col] = {"type":"numeric","label":col,"modes":modes}
+            S.configs[col] = {"type": "numeric", "label": col, "modes": modes}
             S.num_queue.pop(0)
             S.cur_num = S.num_queue[0] if S.num_queue else None
             if S.num_queue:
@@ -523,6 +711,15 @@ def step_configure():
 
 # ──────────────────────────────────────────────────────────────
 #  STEP 4 — Verify labels + reorder
+#
+#  FIX: Both categorical and multi_value now use the unified
+#  S.entries[col] list. Each entry is {"key", "label"}.
+#  Reordering swaps entire dicts, so key and label always stay
+#  together — no drift possible between value order and label order.
+#  Both types show identical UI: raw key + editable label + ▲▼.
+#
+#  FIX: Back button from Verify restores num_queue so users can
+#  re-configure numeric columns.
 # ──────────────────────────────────────────────────────────────
 def step_verify():
     df = S.df
@@ -533,105 +730,111 @@ def step_verify():
     for col in S.selected:
         cfg   = S.configs[col]
         dtype = S.col_types[col]
-
-        icon = {"categorical": "🔤", "multi_value": "🏷️", "numeric": "🔢"}.get(dtype, "•")
+        icon  = {"categorical": "🔤", "multi_value": "🏷️",
+                 "ordered_categorical": "🔢🔤", "numeric": "🔢"}.get(dtype, "•")
 
         with st.expander(f"{icon}  {col}", expanded=True):
 
-            if dtype == "categorical":
-                new_label = st.text_input("Column label:", value=cfg["label"],
-                                          key=f"v_lbl_{col}")
+            if dtype in ("categorical", "multi_value", "ordered_categorical"):
+                # Editable section heading
+                new_label = st.text_input(
+                    "Section heading:", value=cfg["label"], key=f"v_lbl_{col}")
                 cfg["label"] = new_label
 
-                st.markdown("**Category order** — use the ▲ ▼ buttons to reorder:")
-                order = S.cat_order.get(col,
-                        list(df[col].value_counts(dropna=True).index))
+                entries = S.entries.get(col, [])
+                total   = len(df[col].dropna())
 
-                for idx, val in enumerate(order):
-                    cnt   = (df[col] == val).sum()
-                    total = len(df[col].dropna())
-                    pct   = cnt/total*100 if total else 0
-                    r = st.columns([6, 1, 1])
+                if dtype == "categorical":
+                    st.markdown("**Categories** — rename and reorder with ▲ ▼:")
+                    def get_cnt(key):
+                        return (df[col].astype(str) == str(key)).sum()
+                elif dtype == "ordered_categorical":
+                    st.markdown("**Values** — rename (e.g. last row → `≥5th line`) and reorder with ▲ ▼:")
+                    def get_cnt(key):
+                        return (df[col].astype(str) == str(key)).sum()
+                else:
+                    counts = multi_value_counts(df[col])
+                    st.markdown(
+                        "**Terms** — rename and reorder with ▲ ▼.  "
+                        "Percentages are per patient (can sum >100%).")
+                    def get_cnt(key):
+                        return counts.get(key, 0)
+
+                for idx, entry in enumerate(entries):
+                    cnt = get_cnt(entry["key"])
+                    pct = cnt / total * 100 if total else 0
+
+                    r = st.columns([0.5, 2.8, 2.8, 0.45, 0.45])
+
                     r[0].markdown(
-                        f"**{idx+1}.** {val} &nbsp;&nbsp; "
-                        f"<span style='color:#888;font-size:12px'>n={cnt} · {fmt_pct(pct)}</span>",
+                        f"<div style='padding-top:8px;color:#aaa;font-size:12px'>"
+                        f"{idx + 1}.</div>",
                         unsafe_allow_html=True)
-                    if r[1].button("▲", key=f"up_{col}_{idx}", disabled=(idx==0)):
-                        order[idx], order[idx-1] = order[idx-1], order[idx]
-                        S.cat_order[col] = order; st.rerun()
-                    if r[2].button("▼", key=f"dn_{col}_{idx}", disabled=(idx==len(order)-1)):
-                        order[idx], order[idx+1] = order[idx+1], order[idx]
-                        S.cat_order[col] = order; st.rerun()
 
-                S.cat_order[col] = order
-                cfg["order"] = order
-
-            elif dtype == "multi_value":
-                # ── Column-level label ──────────────────────────────
-                new_label = st.text_input("Section heading:", value=cfg["label"],
-                                          key=f"v_lbl_{col}")
-                cfg["label"] = new_label
-
-                counts    = multi_value_counts(df[col])
-                total_pts = len(df[col].dropna())
-                order     = S.cat_order.get(col, cfg["order"])
-                label_map = cfg.get("label_map", {t: t.title() for t in order})
-
-                st.markdown(
-                    "**Terms** — edit display labels and use ▲ ▼ to reorder. "
-                    "Percentages are per patient (can sum >100%)."
-                )
-
-                for idx, term in enumerate(order):
-                    cnt = counts.get(term, 0)
-                    pct = cnt / total_pts * 100 if total_pts else 0
-
-                    r = st.columns([4, 3, 1, 1])
-                    r[0].markdown(
-                        f"**{idx+1}.** `{term}` "
-                        f"<span style='color:#888;font-size:12px'>n={cnt} · {fmt_pct(pct)}</span>",
+                    r[1].markdown(
+                        f"<div style='padding-top:8px;font-size:13px;color:#555'>"
+                        f"{entry['key']}"
+                        f"<span style='color:#aaa;font-size:11px;margin-left:6px'>"
+                        f"n={cnt} · {fmt_pct(pct)}</span></div>",
                         unsafe_allow_html=True)
-                    new_lbl = r[1].text_input(
-                        "Display label", value=label_map.get(term, term.title()),
-                        key=f"mv_lbl_{col}_{idx}", label_visibility="collapsed")
-                    label_map[term] = new_lbl
 
-                    if r[2].button("▲", key=f"mv_up_{col}_{idx}", disabled=(idx==0)):
-                        order[idx], order[idx-1] = order[idx-1], order[idx]
-                        S.cat_order[col] = order; cfg["order"] = order
-                        cfg["label_map"] = label_map; st.rerun()
-                    if r[3].button("▼", key=f"mv_dn_{col}_{idx}", disabled=(idx==len(order)-1)):
-                        order[idx], order[idx+1] = order[idx+1], order[idx]
-                        S.cat_order[col] = order; cfg["order"] = order
-                        cfg["label_map"] = label_map; st.rerun()
+                    new_lbl = r[2].text_input(
+                        "Label", value=entry["label"],
+                        key=f"entry_lbl_{col}_{idx}",
+                        label_visibility="collapsed")
+                    entries[idx]["label"] = new_lbl   # write back immediately
 
-                S.cat_order[col] = order
-                cfg["order"]     = order
-                cfg["label_map"] = label_map
+                    if r[3].button("▲", key=f"up_{col}_{idx}", disabled=(idx == 0)):
+                        entries[idx], entries[idx - 1] = entries[idx - 1], entries[idx]
+                        S.entries[col] = entries
+                        st.rerun()
+
+                    if r[4].button("▼", key=f"dn_{col}_{idx}",
+                                   disabled=(idx == len(entries) - 1)):
+                        entries[idx], entries[idx + 1] = entries[idx + 1], entries[idx]
+                        S.entries[col] = entries
+                        st.rerun()
+
+                S.entries[col] = entries
 
             else:  # numeric
-                mode_names = {"mean_sd":"Mean ± SD","median":"Median [IQR]",
-                              "threshold":"Threshold groups"}
+                mode_names = {
+                    "mean_sd":   "Mean ± SD",
+                    "median":    "Median [IQR]",
+                    "threshold": "Threshold groups",
+                }
                 for idx, mc in enumerate(cfg["modes"]):
                     new_lbl = st.text_input(
-                        f"Label — {mode_names.get(mc['mode'],mc['mode'])}:",
+                        f"Label — {mode_names.get(mc['mode'], mc['mode'])}:",
                         value=mc["label"],
                         key=f"v_num_{col}_{idx}")
                     mc["label"] = new_lbl
                     if mc["mode"] == "threshold":
                         st.caption(
-                            f"Groups: **{mc['label_true']}** ({OSYM.get(mc['op'],'')} {mc['threshold']})"
-                            f"  ·  **{mc['label_false']}** ({CSYM.get(mc['op'],'')} {mc['threshold']})")
+                            f"Groups: **{mc['label_true']}** "
+                            f"({OSYM.get(mc['op'], '')} {fmt_thresh(mc['threshold'])})"
+                            f"  ·  **{mc['label_false']}** "
+                            f"({CSYM.get(mc['op'], '')} {fmt_thresh(mc['threshold'])})")
 
     st.markdown("---")
-    col_l, col_r = st.columns([1,5])
+    col_l, col_r = st.columns([1, 5])
     with col_l:
-        back = 3 if any(S.col_types[c]=="numeric" for c in S.selected) else 2
         if st.button("← Back"):
-            go(back)
+            has_numeric = any(S.col_types[c] == "numeric" for c in S.selected)
+            has_ordered = any(S.col_types[c] == "ordered_categorical" for c in S.selected)
+            if has_numeric:
+                S.num_queue = [c for c in S.selected if S.col_types[c] == "numeric"]
+                S.cur_num   = None
+                go(3)
+            elif has_ordered:
+                S.ord_queue = [c for c in S.selected if S.col_types[c] == "ordered_categorical"]
+                S.cur_ord   = None
+                go(3)
+            else:
+                go(2)
     with col_r:
         if st.button("Build Word table →", type="primary"):
-            S.word_bytes = build_word_bytes(S.selected, S.configs, df)
+            S.word_bytes = build_word_bytes(S.selected, S.configs, S.entries, df)
             go(5)
 
 # ──────────────────────────────────────────────────────────────
@@ -639,7 +842,7 @@ def step_verify():
 # ──────────────────────────────────────────────────────────────
 def step_download():
     if not S.word_bytes:
-        S.word_bytes = build_word_bytes(S.selected, S.configs, S.df)
+        S.word_bytes = build_word_bytes(S.selected, S.configs, S.entries, S.df)
 
     st.markdown(
         '<div class="success-box">'
