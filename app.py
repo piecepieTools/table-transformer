@@ -226,10 +226,12 @@ def build_word_bytes(col_order, configs, df):
 
         if cfg["type"] == "categorical":
             _drow(tbl, cfg["label"], "", "", bold1=True)
+            label_map = cfg.get("label_map", {})
             for val in cfg.get("order", list(series.value_counts(dropna=True).index)):
                 cnt = (series == val).sum()
                 pct = cnt / total * 100 if total else 0
-                _drow(tbl, str(val), str(cnt), fmt_pct(pct), ind1=True)
+                display = label_map.get(str(val), str(val))
+                _drow(tbl, display, str(cnt), fmt_pct(pct), ind1=True)
             n_miss = series.isna().sum()
             if n_miss:
                 _drow(tbl, "Missing", str(n_miss), fmt_pct(n_miss/len(series)*100), ind1=True)
@@ -338,8 +340,10 @@ def step_select():
             for col in selected:
                 dtype = S.col_types[col]
                 if dtype == "categorical":
-                    order = list(df[col].value_counts(dropna=True).index)
-                    S.configs[col]   = {"type":"categorical","label":col,"order":order}
+                    order     = list(df[col].value_counts(dropna=True).index)
+                    label_map = {str(v): str(v) for v in order}
+                    S.configs[col]   = {"type":"categorical","label":col,
+                                        "order":order,"label_map":label_map}
                     S.cat_order[col] = list(order)
                 elif dtype == "multi_value":
                     counts    = multi_value_counts(df[col])
@@ -482,32 +486,42 @@ def step_configure():
 # ══════════════════════════════════════════════════════════════
 def step_rename():
     df = S.df
-    mv_cols = [c for c in S.selected if S.col_types[c] == "multi_value"]
+    # Include both categorical AND multi_value columns
+    rename_cols = [c for c in S.selected
+                   if S.col_types[c] in ("categorical", "multi_value")]
 
-    # Skip this step entirely if no multi_value columns
-    if not mv_cols:
+    # Skip this step entirely if nothing needs renaming
+    if not rename_cols:
         go(5); return
 
     st.markdown('<p class="section-title">Rename values</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="section-sub">Set a display label for each term. '
-        'You will set the order in the next step.</p>',
+        '<p class="section-sub">Set a display label for each value. '        'You will set the order in the next step.</p>',
         unsafe_allow_html=True)
 
-    for col in mv_cols:
-        cfg    = S.configs[col]
-        counts = multi_value_counts(df[col])
-        total  = len(df[col].dropna())
-        order  = cfg.get("order", sorted(counts.keys(), key=lambda k: -counts[k]))
+    for col in rename_cols:
+        cfg   = S.configs[col]
+        dtype = S.col_types[col]
+        total = len(df[col].dropna())
 
-        with st.expander(f"🏷️  {col}", expanded=True):
-            # Section heading
+        if dtype == "multi_value":
+            counts = multi_value_counts(df[col])
+            order  = cfg.get("order", sorted(counts.keys(), key=lambda k: -counts[k]))
+            def get_cnt(v): return counts.get(v, 0)
+            default_lbl = lambda v: v.title()
+            icon = "🏷️"
+        else:  # categorical
+            order  = cfg.get("order", list(df[col].value_counts(dropna=True).index))
+            def get_cnt(v): return (df[col].astype(str) == str(v)).sum()
+            default_lbl = lambda v: str(v)
+            icon = "🔤"
+
+        with st.expander(f"{icon}  {col}", expanded=True):
             new_heading = st.text_input("Section heading in table:", value=cfg["label"],
                                         key=f"rn_heading_{col}")
             cfg["label"] = new_heading
 
             st.markdown("---")
-            # Column headers for the rename table
             hc = st.columns([3, 3, 2])
             hc[0].markdown("<span style='font-size:12px;color:#888'>Raw value in spreadsheet</span>",
                            unsafe_allow_html=True)
@@ -516,20 +530,21 @@ def step_rename():
             hc[2].markdown("<span style='font-size:12px;color:#888'>Count</span>",
                            unsafe_allow_html=True)
 
-            label_map = cfg.get("label_map", {t: t.title() for t in order})
+            label_map = cfg.get("label_map", {str(v): default_lbl(str(v)) for v in order})
 
-            for term in order:
-                cnt = counts.get(term, 0)
-                pct = cnt / total * 100 if total else 0
+            for val in order:
+                key  = str(val)
+                cnt  = get_cnt(val)
+                pct  = cnt / total * 100 if total else 0
                 r = st.columns([3, 3, 2])
                 r[0].markdown(
-                    f"<div style='padding-top:8px'><span class='raw-val'>{term}</span></div>",
+                    f"<div style='padding-top:8px'><span class='raw-val'>{key}</span></div>",
                     unsafe_allow_html=True)
-                # Key is term-based, NOT position-based — no drift possible
+                # Key is value-based, NOT position-based — no drift on reorder
                 new_lbl = r[1].text_input(
-                    "label", value=label_map.get(term, term.title()),
-                    key=f"rn_lbl_{col}_{term}", label_visibility="collapsed")
-                label_map[term] = new_lbl
+                    "label", value=label_map.get(key, default_lbl(key)),
+                    key=f"rn_lbl_{col}_{key}", label_visibility="collapsed")
+                label_map[key] = new_lbl
                 r[2].markdown(
                     f"<div style='padding-top:8px;font-size:13px;color:#555'>"
                     f"n={cnt} <span class='cnt-badge'>({fmt_pct(pct)})</span></div>",
@@ -575,16 +590,18 @@ def step_arrange():
         with st.expander(f"{icon}  {col}", expanded=True):
 
             if dtype == "categorical":
-                order = S.cat_order.get(col,
-                        list(df[col].value_counts(dropna=True).index))
-                total = len(df[col].dropna())
+                order     = S.cat_order.get(col,
+                            list(df[col].value_counts(dropna=True).index))
+                total     = len(df[col].dropna())
+                label_map = cfg.get("label_map", {})
                 for idx, val in enumerate(order):
-                    cnt = (df[col] == val).sum()
-                    pct = cnt / total * 100 if total else 0
+                    cnt   = (df[col].astype(str) == str(val)).sum()
+                    pct   = cnt / total * 100 if total else 0
+                    label = label_map.get(str(val), str(val))
                     r = st.columns([6, 1, 1])
                     r[0].markdown(
                         f"<div style='padding:6px 0'>"
-                        f"<b>{idx+1}.</b> {val} "
+                        f"<b>{idx+1}.</b> {label} "
                         f"<span style='color:#aaa;font-size:12px'>n={cnt} · {fmt_pct(pct)}</span>"
                         f"</div>", unsafe_allow_html=True)
                     if r[1].button("▲", key=f"up_{col}_{idx}", disabled=(idx==0)):
@@ -642,8 +659,9 @@ def step_arrange():
     cl, cr = st.columns([1,5])
     with cl:
         if st.button("← Back"):
-            mv_cols = [c for c in S.selected if S.col_types[c] == "multi_value"]
-            if mv_cols:
+            rename_cols = [c for c in S.selected
+                             if S.col_types[c] in ("categorical", "multi_value")]
+            if rename_cols:
                 go(4)
             elif any(S.col_types[c] == "numeric" for c in S.selected):
                 S.num_queue = [c for c in S.selected if S.col_types[c] == "numeric"]
